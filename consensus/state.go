@@ -1171,7 +1171,6 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 	} else {
 		// Create a new proposal block from state/txs from the mempool.
 		fmt.Println("Creating a new proposal block in decide proposal")
-		debug.PrintStack()
 		block, blockParts = cs.createProposalBlock()
 		if block == nil {
 			return
@@ -1369,7 +1368,6 @@ func (cs *State) defaultDoPrevote(height int64, round int32, allowOldBlocks bool
 		err = cs.blockExec.ValidateBlockTime(cs.state, cs.ProposalBlock)
 		if err != nil {
 			// ProposalBlock is invalid, prevote nil.
-			debug.PrintStack()
 			logger.Error("enterPrevote: ProposalBlock time is invalid", "err", err)
 			cs.signAddVote(tmproto.PrevoteType, nil, types.PartSetHeader{})
 			return
