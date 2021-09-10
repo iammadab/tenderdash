@@ -127,6 +127,7 @@ func (blockExec *BlockExecutor) CreateProposalBlock(
 	maxDataBytes := types.MaxDataBytes(maxBytes, crypto.BLS12381, evSize, state.Validators.Size())
 
 	txs := blockExec.mempool.ReapMaxBytesMaxGas(maxDataBytes, maxGas)
+	fmt.Println("Mempool size", blockExec.mempool.Size())
 
 	nextCoreChainLock := blockExec.NextCoreChainLock
 

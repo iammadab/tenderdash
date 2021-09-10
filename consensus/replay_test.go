@@ -333,6 +333,31 @@ func findProposer(validatorStubs []*validatorStub, proTxHash crypto.ProTxHash) *
 	panic("validator not found")
 }
 
+func printProtxHash(states []*State, message string) {
+	fmt.Println()
+	fmt.Println(message)
+	fmt.Println("...")
+	fmt.Println("State Owner", states[0].privValidatorProTxHash)
+	_, currentValidators := states[0].GetValidatorSet()
+	protxHashes := currentValidators.GetProTxHashes()
+	for _, hash := range protxHashes {
+		fmt.Println(hash)
+	}
+	fmt.Println("...")
+	fmt.Println()
+}
+
+func printBlockTransactions(block *types.Block) {
+	fmt.Println()
+	fmt.Println("Block transactions")
+	fmt.Println("Height", block.Height)
+	fmt.Println("Count:", len(block.Data.Txs))
+	for _, transaction := range block.Data.Txs {
+		fmt.Println(transaction)
+	}
+	fmt.Println()
+}
+
 // This is actually not a test, it's for storing validator change tx data for testHandshakeReplay
 func TestSimulateValidatorsChange(t *testing.T) {
 	nPeers := 7
@@ -350,13 +375,18 @@ func TestSimulateValidatorsChange(t *testing.T) {
 
 	partSize := types.BlockPartSizeBytes
 
+	// Seems state changes are being watched from the perspective of css[0]
 	newRoundCh := subscribe(css[0].eventBus, types.EventQueryNewRound)
 	proposalCh := subscribe(css[0].eventBus, types.EventQueryCompleteProposal)
 
+	// Vss contains a list of all the peers,
+	// first validators then non validators
+	// css and vss are aligned css[0] corresponds to vss[0]
 	vss := make([]*validatorStub, nPeers)
 	for i := 0; i < nPeers; i++ {
 		vss[i] = newValidatorStub(css[i].privValidator, int32(i))
 	}
+	// Height starts at 1, round starts at 0
 	height, round := css[0].Height, css[0].Round
 
 	// start the machine
@@ -364,39 +394,85 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	incrementHeight(vss...)
 	ensureNewRound(newRoundCh, height, 0)
 	ensureNewProposal(proposalCh, height, round)
+
+	// Returns information about the consensus state
 	rs := css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
+	// Gets all validators to sign the votes and broadcasts it to all the peers
+	// Once a peer receives the vote, they attempt to handle it
+	// see: state.go handleMsg
 	signAddVotes(css[0], tmproto.PrevoteType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
 	signAddVotes(css[0], tmproto.PrecommitType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
+	// Adding votes and broadcasting them should change the internal state of the validators
+	// Here, we are making sure that a new round event occurs
+	// i.e we start working on a new height and the round is 0
+	// all these are from the perspective of css[0]
 	ensureNewRound(newRoundCh, height+1, 0)
 
+	// printProtxHash(css, "Before adding first validator")
+
 	// HEIGHT 2
+	// Here we turn one of the peers to a validator
+	// There is a new quorumhash and publickey
 	updatedValidators2, _, newThresholdPublicKey, quorumHash2 := updateConsensusNetAddNewValidators(css, height, 1, false)
 	height++
 	fmt.Printf("quorum hash is now %X\n", quorumHash2)
 	incrementHeight(vss...)
+	// Create an array to hold the different transactions we want to run on the peers
+	// kvstore is the abci application, responsible to creating the transactions
+	// and sending them to the consensus engine
 	updateTransactions := make([][]byte, len(updatedValidators2)+2)
+	// First we create a transaction for changing the validator set
+	// Validator set change transactionsn are of the form
+	// 'val:proTxHash:pubString:power'
+	// The first len(updatedValidators2) slots of the transactions array are filled with
+	// those kinds of transaction
 	for i := 0; i < len(updatedValidators2); i++ {
 		// start by adding all validator transactions
 		abciPubKey, err := cryptoenc.PubKeyToProto(updatedValidators2[i].PubKey)
 		require.NoError(t, err)
 		updateTransactions[i] = kvstore.MakeValSetChangeTx(updatedValidators2[i].ProTxHash, &abciPubKey, testMinPower)
 	}
+	// Transform the public key to protobuf pub key
 	abciThresholdPubKey, err := cryptoenc.PubKeyToProto(newThresholdPublicKey)
 	require.NoError(t, err)
+	// Make a threshold public key change transaction of the form
+	// tpk:publickey
 	updateTransactions[len(updatedValidators2)] = kvstore.MakeThresholdPublicKeyChangeTx(abciThresholdPubKey)
+	// Make a quorum hash change transaction of the form
+	// vqh:quorumhash
 	updateTransactions[len(updatedValidators2)+1] = kvstore.MakeQuorumHashTx(quorumHash2)
+
+	// So now we have transactions to change the validator set, threshold public key and quorum hash
+	// Next up, we verify the transactions against the mempool
+	// this just verifies the basic elements of the transaction but does not run any state changes
+	// on the abci machine
+	// The transactions in update transactions are added to the mempool tho
 	for _, updateTransaction := range updateTransactions {
 		err = assertMempool(css[0].txNotifier).CheckTx(updateTransaction, nil, mempl.TxInfo{})
 		assert.Nil(t, err)
 	}
 
+	// Creates a new block based on the transactions in the mempool
+	// and the last precommits (I don't know why this happens tho)
+	fmt.Println("Create proposal trigger")
 	propBlock, _ := css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts := propBlock.MakePartSet(partSize)
 	blockID := types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
 	// stateID := types.StateID{LastAppHash: css[0].state.AppHash}
 
+	// Creates a new proposal based on the proposal block generated
+	// Question: When does the actual block get sent tho??
 	proposal := types.NewProposal(vss[1].Height, 1, round, -1, blockID)
 	p := proposal.ToProto()
+
+	// Signs the proposal and appends the signature to the proposal
+	// A quorum performs signing, every quorum has a set of validators
+	// Each validator has a set of signing keys (pub and priv) for all the quorums they belong to
+	// When we change the validator set, I believe a new quorum is created and the new keys are added
+	// to the new validator set
+	// We are using the initial quorum from the genesis block as that is the only quorum available
+	// vss[1] belongs to the genesis quorum
 	if _, err := vss[1].SignProposal(config.ChainID(), genDoc.QuorumType, genDoc.QuorumHash, p); err != nil {
 		t.Fatal("failed to sign bad proposal", err)
 	}
@@ -404,18 +480,37 @@ func TestSimulateValidatorsChange(t *testing.T) {
 
 	// set the proposal block to state on node 0, this will result in a signed prevote,
 	// so we do not need to prevote with it again (hence the vss[1:nVals])
+	//
+	// Hmm - So by running SetProposalAndBlock, this node doesn't need to prevote on the block again
+	// I can see that this method broadcast the proposal and block parts to all the other peers
+	// Okay, makes sense.
 	if err := css[0].SetProposalAndBlock(proposal, propBlock, propBlockParts, "some peer"); err != nil {
 		t.Fatal(err)
 	}
+	// Wait to see the new proposal
 	ensureNewProposal(proposalCh, height, round)
+	// Get the new consensus state, it should contain the new block
+	// with all the transactions
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
+	// The rest of the validators commit the proposal block and broadcasts it
 	signAddVotes(css[0], tmproto.PrevoteType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
 	signAddVotes(css[0], tmproto.PrecommitType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
+	// The first node should get majority precommit votes, make a commit block and move to the
+	// next height
+	// Question: How does it know what 2/3 is tho
 	ensureNewRound(newRoundCh, height+1, 0)
 
 	// HEIGHT 3
+	// New height!!!
 	height++
 	incrementHeight(vss...)
+	// Create a new proposal, but what transactions would this contain
+	// Using the debugger the transactions still follows the same format as before
+	// But I don't see any new transaction being added to the mempool
+	// TODO: Need to investigate this!!
+	// After checking this, the transactions in the prop block are empty
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
@@ -433,21 +528,31 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	}
 	ensureNewProposal(proposalCh, height, round)
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
 	signAddVotes(css[0], tmproto.PrevoteType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
 	signAddVotes(css[0], tmproto.PrecommitType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vss[1:nVals]...)
 	ensureNewRound(newRoundCh, height+1, 0)
+	// The above does the usual, create the block, commit it and transition to the next round
+	// printProtxHash(css, "Added a new validator")
 
 	// HEIGHT 4
 	// 1 new validator comes in here from block 2
+
+	// Adding two new validators
 	updatedValidators4, _, newThresholdPublicKey, quorumHash4 := updateConsensusNetAddNewValidators(css, height, 2, false)
 	height++
 	incrementHeight(vss...)
+	// Create an array to hold the transactions
 	updateTransactions2 := make([][]byte, len(updatedValidators4)+2)
 	for i := 0; i < len(updatedValidators4); i++ {
 		// start by adding all validator transactions
 		abciPubKey, err := cryptoenc.PubKeyToProto(updatedValidators4[i].PubKey)
 		require.NoError(t, err)
 		updateTransactions2[i] = kvstore.MakeValSetChangeTx(updatedValidators4[i].ProTxHash, &abciPubKey, testMinPower)
+		// Believe this is just for logging and the old pub key is not actually needed
+		// Seems the protx has doesn't change but the public key of a validator changes
+		// won't say the public key changed, it got an additional one for being part
+		// of a new quorum
 		var oldPubKey crypto.PubKey
 		for _, validatorAt2 := range updatedValidators2 {
 			if bytes.Equal(validatorAt2.ProTxHash, updatedValidators4[i].ProTxHash) {
@@ -465,10 +570,12 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	require.NoError(t, err)
 	updateTransactions2[len(updatedValidators4)] = kvstore.MakeThresholdPublicKeyChangeTx(abciThresholdPubKey2)
 	updateTransactions2[len(updatedValidators4)+1] = kvstore.MakeQuorumHashTx(quorumHash4)
+	// Insert the new transactions into the mem pool
 	for _, updateTransaction := range updateTransactions2 {
 		err = assertMempool(css[0].txNotifier).CheckTx(updateTransaction, nil, mempl.TxInfo{})
 		assert.Nil(t, err)
 	}
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	if len(propBlock.Txs) != 9 {
@@ -476,9 +583,13 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	}
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
 
+	// At every height, a new node from the validator set is chosen as the proposer
+	// this process is deterministic, so every node knows the proposer given the height
+	// That is why the protxhash for the proposer is gotten from css[0]
 	vssProposer := findProposer(vss, css[0].Validators.Proposer.ProTxHash)
 	proposal = types.NewProposal(vss[3].Height, 1, round, -1, blockID)
 	p = proposal.ToProto()
+	// Once we have the proposal, the proposer signs it and appends the signature
 	if _, err := vssProposer.SignProposal(config.ChainID(), genDoc.QuorumType, quorumHash2, p); err != nil {
 		t.Fatal("failed to sign bad proposal", err)
 	}
@@ -490,9 +601,26 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	}
 	ensureNewProposal(proposalCh, height, round)
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
+	// All the above where same as before
+	// We added one validator at the previous commit hence the +1
+	// We would add two more after this commit
+	// We sort the validators by protxhash because their voting power is the same
+	// Noticed that that last validator does not have a protxhash
 	vssForSigning := vss[0 : nVals+1]
+	// TODO: After sort, the new guy moved positions, it still does not have a protxhash
+	// TODO: Investigate this!!
+	// Maybe we sort because the system is supposed to work even if we sort
+	// the abci might change their power and the application should be able to
+	// work with that?
+	// When I don't sort, the next ensure new round fails
+	// so sorting has some form of importance
 	sort.Sort(ValidatorStubsByPower(vssForSigning))
 
+	// css represents an array of state objects
+	// each state object has a validator
+	// this gets the signing validator given the css index
+	// why are we doing this tho
 	valIndexFn := func(cssIdx int) int {
 		for i, vs := range vssForSigning {
 			vsProTxHash, err := vs.GetProTxHash()
@@ -508,9 +636,20 @@ func TestSimulateValidatorsChange(t *testing.T) {
 		panic(fmt.Sprintf("validator css[%d] not found in newVss", cssIdx))
 	}
 
+	// Okay, we get the index of the validator for css[0]
 	selfIndex := valIndexFn(0)
 
 	// A new validator should come in
+	// -
+	// We prevent that validator from signing the votes
+	// I guess this is similar to what we did with vss[1:nVals]
+	// but why follow this route??
+	// won't vss[1:nVals+1] achieve the same effect??
+	// I think it is because of the sorting, when you sort the validator for css[0] might end up anywhere
+	// and we don't want that validator to sign anymore, so this is an attempt to achieve not signing with that
+	// validator
+	// still begs the question tho, why are we sorting??
+	// TODO: Investigate this
 	for i := 0; i < nVals+1; i++ {
 		if i == selfIndex {
 			continue
@@ -523,18 +662,27 @@ func TestSimulateValidatorsChange(t *testing.T) {
 		}
 		signAddVotes(css[0], tmproto.PrecommitType, rs.ProposalBlock.Hash(), rs.ProposalBlockParts.Header(), vssForSigning[i])
 	}
+	// Normal, they should all sign, broadcast and move to the next height
 	ensureNewRound(newRoundCh, height+1, 0)
 
 	// HEIGHT 5
 	height++
 	incrementHeight(vss...)
+	// Creates a new proposal again
+	// Not sure where the transactions are coming from still
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
 
 	proposal = types.NewProposal(vss[2].Height, 1, round, -1, blockID)
 	p = proposal.ToProto()
+	// Above, same as before
+	// Why are we getting the proposerProTxHash??
 	proposerProTxHash := css[0].RoundState.Validators.GetProposer().ProTxHash
+	// This function finds the validator that is supposed to propose the block
+	// given the protxhash
+	// Last time we used findProposer - why the change?
 	valIndexFnByProTxHash := func(proTxHash crypto.ProTxHash) int {
 		for i, vs := range vss {
 			vsProTxHash, err := vs.GetProTxHash()
@@ -546,7 +694,9 @@ func TestSimulateValidatorsChange(t *testing.T) {
 		}
 		panic(fmt.Sprintf("validator proTxHash %X not found in newVss", proposerProTxHash))
 	}
+	// Get the proposer index
 	proposerIndex := valIndexFnByProTxHash(proposerProTxHash)
+	// Sign the proposal with that validator and attach the signature
 	if _, err := vss[proposerIndex].SignProposal(config.ChainID(), genDoc.QuorumType, quorumHash2, p); err != nil {
 		t.Fatal("failed to sign bad proposal", err)
 	}
@@ -558,6 +708,8 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	}
 	ensureNewProposal(proposalCh, height, round)
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
+	// Again we prevent the validator for css[0] from signing the votes
 	for i := 0; i < nVals+1; i++ {
 		if i == selfIndex {
 			continue
@@ -574,10 +726,13 @@ func TestSimulateValidatorsChange(t *testing.T) {
 
 	// HEIGHT 6
 	//
+	// Remove 1 validator
 	updatedValidators6, _, newThresholdPublicKey, quorumHash6 := updateConsensusNetRemoveValidators(css, height,
 		1, false)
 	height++
+	// Create transaction array
 	updateTransactions3 := make([][]byte, len(updatedValidators6)+2)
+	// Add the validator set change transactions
 	for i := 0; i < len(updatedValidators6); i++ {
 		// start by adding all validator transactions
 		abciPubKey, err := cryptoenc.PubKeyToProto(updatedValidators6[i].PubKey)
@@ -596,17 +751,21 @@ func TestSimulateValidatorsChange(t *testing.T) {
 			updatedValidators6[i].PubKey,
 		)
 	}
+	// Add transactions for threshold pub key and quorum hash
 	abciThresholdPubKey, err = cryptoenc.PubKeyToProto(newThresholdPublicKey)
 	require.NoError(t, err)
 	updateTransactions3[len(updatedValidators6)] =
 		kvstore.MakeThresholdPublicKeyChangeTx(abciThresholdPubKey)
 	updateTransactions3[len(updatedValidators6)+1] = kvstore.MakeQuorumHashTx(quorumHash6)
 
+	// Add the transactions to the mem pool
 	for _, updateTransaction := range updateTransactions3 {
 		err = assertMempool(css[0].txNotifier).CheckTx(updateTransaction, nil, mempl.TxInfo{})
 		assert.Nil(t, err)
 	}
 	incrementHeight(vss...)
+	// Create proposal
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
@@ -616,6 +775,8 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	proposer := css[0].RoundState.Validators.GetProposer()
 	proposerProTxHash = proposer.ProTxHash
 	proposerPubKey := proposer.PubKey
+	// why repeat this function definition??
+	// Get the index of the proposer
 	valIndexFnByProTxHash = func(proTxHash crypto.ProTxHash) int {
 		for i, vs := range vss {
 			vsProTxHash, err := vs.GetProTxHash()
@@ -631,8 +792,19 @@ func TestSimulateValidatorsChange(t *testing.T) {
 		))
 	}
 	proposerIndex = valIndexFnByProTxHash(proposerProTxHash)
+	// Get the validators at the current height??
 	validatorsAtProposalHeight := css[0].state.ValidatorsAtHeight(p.Height)
 
+	// We have always been signing with the genesis quorum hash
+	// but now we are using the quorum hash for validators at the current height
+	// checking the ValidatorsAtHeight function, it seems it returns
+	// state.LastValidator, state.NextValidators or state.Validators depending on the height
+	// using a breakpoint, it return state.Validators
+	// meaning the height is not the last block height or last block height + 2
+	// seems to always return state.Validators
+	// TODO: why does it have 3 different validators tho
+	// TODO: validatorsAtProposalHeight has just 5 validators in it
+	// I would expect it to be 7
 	signID, err :=
 		vss[proposerIndex].SignProposal(
 			config.ChainID(), genDoc.QuorumType, validatorsAtProposalHeight.QuorumHash, p,
@@ -641,16 +813,21 @@ func TestSimulateValidatorsChange(t *testing.T) {
 		t.Fatal("failed to sign bad proposal", err)
 	}
 
+	// Get the public key of proposer for the chosen quorum hash used above
 	proposerPubKey2, err := vss[proposerIndex].GetPubKey(validatorsAtProposalHeight.QuorumHash)
 	if err != nil {
 		t.Fatal("failed to get public key")
 	}
+	// Get the protx has of the proper also
+	// is this not already in properProTxHash
 	proposerProTxHash2, err := vss[proposerIndex].GetProTxHash()
 
+	// TODO: Checking if they are the same, why would this change???
 	if !bytes.Equal(proposerProTxHash2.Bytes(), proposerProTxHash.Bytes()) {
 		t.Fatal("wrong proposer", err)
 	}
 
+	// Same here
 	if !bytes.Equal(proposerPubKey2.Bytes(), proposerPubKey.Bytes()) {
 		t.Fatal("wrong proposer pubKey", err)
 	}
@@ -671,13 +848,19 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	}
 	ensureNewProposal(proposalCh, height, round)
 
+	// vss has grown to 7
 	vssForSigning = vss[0 : nVals+3]
+	// sorting again
 	sort.Sort(ValidatorStubsByPower(vssForSigning))
 
+	// getting the index of the validator for css[0]
 	selfIndex = valIndexFn(0)
 
 	// All validators should be in now
+	// -
+	// Sign the votes
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
 	for i := 0; i < nVals+3; i++ {
 		if i == selfIndex {
 			continue
@@ -702,14 +885,19 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	// HEIGHT 7
 	height++
 	incrementHeight(vss...)
+	// Again with which transactions
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
 
 	proposal = types.NewProposal(vss[2].Height, 1, round, -1, blockID)
 	p = proposal.ToProto()
+	// Get the protx hash of the proposer for the new height
 	proposerProTxHash = css[0].RoundState.Validators.GetProposer().ProTxHash
+	// Get the proposer validator index
 	proposerIndex = valIndexFnByProTxHash(proposerProTxHash)
+	// Seems we are using a new quorum hash here again to sign the proposal
 	validatorsAtProposalHeight = css[0].state.ValidatorsAtHeight(p.Height)
 	if _, err := vss[proposerIndex].SignProposal(
 		config.ChainID(), genDoc.QuorumType, validatorsAtProposalHeight.QuorumHash, p,
@@ -725,8 +913,11 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	selfIndex = valIndexFn(0)
 	ensureNewProposal(proposalCh, height, round)
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
 
 	// Still have 7 validators
+	// -
+	// TODO: Yeah, why do we still have 7 validators
 	for i := 0; i < nVals+3; i++ {
 		if i == selfIndex {
 			continue
@@ -742,14 +933,17 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	ensureNewRound(newRoundCh, height+1, 0)
 
 	// HEIGHT 8
-
+	// Get the protx hash of the last validator
 	proTxHashToRemove := updatedValidators6[len(updatedValidators6)-1].ProTxHash
+	// Get a new set of validators that have that protx hash removed
 	updatedValidators8, _, newThresholdPublicKey, quorumHash8 := updateConsensusNetRemoveValidatorsWithProTxHashes(css,
 		height, []crypto.ProTxHash{proTxHashToRemove}, false)
 	height++
 	incrementHeight(vss...)
 
+	// Create an array to hold the transactions
 	updateTransactions4 := make([][]byte, len(updatedValidators8)+2)
+	// Add all the validator set changes
 	for i := 0; i < len(updatedValidators8); i++ {
 		// start by adding all validator transactions
 		abciPubKey, err := cryptoenc.PubKeyToProto(updatedValidators8[i].PubKey)
@@ -758,15 +952,19 @@ func TestSimulateValidatorsChange(t *testing.T) {
 			updatedValidators8[i].ProTxHash, &abciPubKey, testMinPower,
 		)
 	}
+	// add the threshold key and the quorum hash transactions
 	abciThresholdPubKey, err = cryptoenc.PubKeyToProto(newThresholdPublicKey)
 	require.NoError(t, err)
 	updateTransactions4[len(updatedValidators8)] = kvstore.MakeThresholdPublicKeyChangeTx(abciThresholdPubKey)
 	updateTransactions4[len(updatedValidators8)+1] = kvstore.MakeQuorumHashTx(quorumHash8)
 
+	// add all the transactions to the mem pool
 	for _, updateTransaction := range updateTransactions4 {
 		err = assertMempool(css[0].txNotifier).CheckTx(updateTransaction, nil, mempl.TxInfo{})
 		assert.Nil(t, err)
 	}
+	// create a new proposal block
+	fmt.Println("Create proposal trigger")
 	propBlock, _ = css[0].createProposalBlock() // changeProposer(t, cs1, vs2)
 	propBlockParts = propBlock.MakePartSet(partSize)
 	blockID = types.BlockID{Hash: propBlock.Hash(), PartSetHeader: propBlockParts.Header()}
@@ -774,9 +972,12 @@ func TestSimulateValidatorsChange(t *testing.T) {
 	proposal = types.NewProposal(vss[5].Height, 1, round, -1, blockID)
 	p = proposal.ToProto()
 	proposer = css[0].RoundState.Validators.GetProposer()
+	// Get the proposer protxhash and public key
 	proposerProTxHash = proposer.ProTxHash
 	proposerPubKey = proposer.PubKey
+	// Get the proposer validator index based on the protxhash
 	proposerIndex = valIndexFnByProTxHash(proposerProTxHash)
+	// Sign with new quorum hash again
 	validatorsAtProposalHeight = css[0].state.ValidatorsAtHeight(p.Height)
 	signID, err = vss[proposerIndex].SignProposal(
 		config.ChainID(), genDoc.QuorumType, validatorsAtProposalHeight.QuorumHash, p,
@@ -809,9 +1010,11 @@ func TestSimulateValidatorsChange(t *testing.T) {
 
 	ensureNewProposal(proposalCh, height, round)
 	rs = css[0].GetRoundState()
+	printBlockTransactions(rs.ProposalBlock)
 	// Reflect the changes to vss[nVals] at height 3 and resort newVss.
 	vssForSigning = vss[0 : nVals+3]
 	sort.Sort(ValidatorStubsByPower(vssForSigning))
+	// TODO: Why this???
 	vssForSigning = vssForSigning[0 : nVals+2]
 	selfIndex = valIndexFn(0)
 	for i := 0; i < nVals+2; i++ {

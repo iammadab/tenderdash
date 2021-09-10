@@ -821,12 +821,20 @@ func updateConsensusNetRemoveValidators(css []*State, height int64, removeValCou
 
 	validatorProTxHashes := currentValidators.GetProTxHashes()
 	removedValidatorProTxHashes := validatorProTxHashes[len(validatorProTxHashes)-removeValCount:]
+	fmt.Println()
+	fmt.Println("Protx hashes before update remove call")
+	for _, hash := range validatorProTxHashes {
+		fmt.Println(hash)
+	}
+	fmt.Println()
 	return updateConsensusNetRemoveValidatorsWithProTxHashes(css, height, removedValidatorProTxHashes, validate)
 }
 
 func updateConsensusNetRemoveValidatorsWithProTxHashes(css []*State, height int64, removalProTxHashes []crypto.ProTxHash, validate bool) ([]*types.Validator, []*types.Validator, crypto.PubKey, crypto.QuorumHash) {
+	fmt.Println("To remove", removalProTxHashes)
 	currentValidatorCount := len(css[0].Validators.Validators)
 	currentValidators := css[0].Validators
+	// _, currentValidators := css[0].GetValidatorSet()
 
 	if validate {
 		for _, cssi := range css {
@@ -840,6 +848,12 @@ func updateConsensusNetRemoveValidatorsWithProTxHashes(css []*State, height int6
 	}
 
 	validatorProTxHashes := currentValidators.GetProTxHashes()
+	fmt.Println()
+	fmt.Println("Protx hash during update")
+	for _, hash := range validatorProTxHashes {
+		fmt.Println(hash)
+	}
+	fmt.Println()
 	var newValidatorProTxHashes []crypto.ProTxHash
 	for _, validatorProTxHash := range validatorProTxHashes {
 		found := false
@@ -853,6 +867,12 @@ func updateConsensusNetRemoveValidatorsWithProTxHashes(css []*State, height int6
 		}
 	}
 	validatorProTxHashes = newValidatorProTxHashes
+	fmt.Println()
+	fmt.Println("Protx hash after update")
+	for _, hash := range validatorProTxHashes {
+		fmt.Println(hash)
+	}
+	fmt.Println()
 	sort.Sort(crypto.SortProTxHash(validatorProTxHashes))
 	// now that we have the list of all the protxhashes we need to regenerate the keys and the threshold public key
 	validatorProTxHashes, privKeys, thresholdPublicKey := bls12381.CreatePrivLLMQDataOnProTxHashesDefaultThreshold(validatorProTxHashes)

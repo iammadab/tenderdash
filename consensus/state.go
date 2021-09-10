@@ -876,6 +876,10 @@ func (cs *State) handleMsg(mi msgInfo, fromReplay bool) {
 	case *VoteMessage:
 		// attempt to add the vote and dupeout the validator if its a duplicate signature
 		// if the vote gives us a 2/3-any or 2/3-one, we transition
+
+		// Try to add the vote, given the vote and the id of the peer
+		// Peer id is contained in the message
+		// TODO: Checkout the peer id changes
 		added, err = cs.tryAddVote(msg.Vote, peerID)
 		if added {
 			cs.statsMsgQueue <- mi
@@ -1137,6 +1141,7 @@ func (cs *State) enterPropose(height int64, round int32) {
 		return
 	}
 
+
 	if cs.isProposer(proTxHash) {
 		logger.Debug("propose step; our turn to propose", "proposer", proTxHash, "privValidator",
 			cs.privValidator)
@@ -1164,6 +1169,7 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 		block, blockParts = cs.ValidBlock, cs.ValidBlockParts
 	} else {
 		// Create a new proposal block from state/txs from the mempool.
+		fmt.Println("Creating a new proposal block in decide proposal")
 		block, blockParts = cs.createProposalBlock()
 		if block == nil {
 			return
@@ -2315,10 +2321,12 @@ func (cs *State) tryAddVote(vote *types.Vote, peerID p2p.ID) (bool, error) {
 	return added, nil
 }
 
+// Votes are either of type prevote or precommit
 func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error) {
 	// A precommit for the previous height?
 	// These come in while we wait timeoutCommit
 	if vote.Height+1 == cs.Height && vote.Type == tmproto.PrecommitType {
+		fmt.Println("Got an old precommit")
 		if cs.Step != cstypes.RoundStepNewHeight {
 			// Late precommit at prior height is ignored
 			cs.Logger.Debug("precommit vote came in after commit timeout and has been ignored", "vote", vote)
@@ -2345,6 +2353,7 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 		if cs.config.SkipTimeoutCommit && cs.LastPrecommits.HasAll() {
 			// go straight to new round (skip timeout commit)
 			// cs.scheduleTimeout(time.Duration(0), cs.Height, 0, cstypes.RoundStepNewHeight)
+			fmt.Println("Entered a new round")
 			cs.enterNewRound(cs.Height, 0)
 		}
 
@@ -2367,6 +2376,7 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 		return
 	}
 
+	// I believe this checks if a vote is linked to the last block committed
 	if vote.BlockID.Hash != nil && !bytes.Equal(vote.StateID.LastAppHash, cs.state.AppHash) {
 		added = false
 		err = errors.New("vote state last app hash does not match the known state app hash")
@@ -2389,6 +2399,7 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 	)
 
 	height := cs.Height
+	// Add to the vote section of the state
 	added, err = cs.Votes.AddVote(vote, peerID)
 	if !added {
 		if err != nil {
@@ -2414,8 +2425,12 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 	}
 	cs.evsw.FireEvent(types.EventVote, vote)
 
+	// Believe the vote has been added at this point
+	// I guess now we do things based on the new state
 	switch vote.Type {
 	case tmproto.PrevoteType:
+		fmt.Println("Trying to add prevote")
+		// Get all the prevotes
 		prevotes := cs.Votes.Prevotes(vote.Round)
 		cs.Logger.Debug("added vote to prevote", "vote", vote, "prevotes", prevotes.LogString())
 
@@ -2497,6 +2512,7 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 		}
 
 	case tmproto.PrecommitType:
+		fmt.Println("Trying to add precommit")
 		precommits := cs.Votes.Precommits(vote.Round)
 		data := precommits.LogString()
 		cs.Logger.Debug("added vote to precommit",
