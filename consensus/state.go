@@ -1068,7 +1068,8 @@ func (cs *State) enterNewRound(height int64, round int32) {
 			cs.scheduleTimeout(cs.config.CreateEmptyBlocksInterval, height, round,
 				cstypes.RoundStepNewRound)
 		}
-	} else {
+	} else if !cs.config.DontAutoPropose { // DontAutoPropose should always be false, except for specific tests where
+		// proposals are created manually
 		cs.enterPropose(height, round)
 	}
 }
@@ -1170,6 +1171,7 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 	} else {
 		// Create a new proposal block from state/txs from the mempool.
 		fmt.Println("Creating a new proposal block in decide proposal")
+		debug.PrintStack()
 		block, blockParts = cs.createProposalBlock()
 		if block == nil {
 			return
